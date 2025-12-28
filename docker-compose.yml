@@ -1,0 +1,35 @@
+services:
+  scion-sync:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: scion-sync:latest
+    container_name: scion-sync
+    restart: unless-stopped
+
+    ports:
+      - "${PORT:-3000}:3000"
+
+    environment:
+      - PORT=3000
+      - HOST=0.0.0.0
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - VAULT_PATH=/data/vault
+
+    volumes:
+      # Mount host vault directory to container
+      # On Raspberry Pi: /home/pi/scion-vault
+      - ${VAULT_HOST_PATH:-./vault}:/data/vault
+
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
