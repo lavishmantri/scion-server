@@ -30,6 +30,7 @@ Step-by-step guides for setting up a Raspberry Pi to run the Scion Sync server.
 | [03 - Tailscale](./03-tailscale.md) | Secure remote access via Tailscale VPN |
 | [04 - Docker](./04-docker.md) | Install Docker and Docker Compose |
 | [05 - Scion Deployment](./05-scion-deployment.md) | Deploy Scion Sync server |
+| [06a - Obsidian Plugin](./06a-obsidian-plugin.md) | Install and configure Obsidian plugin |
 | [06 - Optional Tools](./06-optional-tools.md) | Raspberry Pi Connect, monitoring, etc. |
 | [07 - Hotspot Mode](./07-hotspot-mode.md) | Offline sync via Pi WiFi hotspot |
 

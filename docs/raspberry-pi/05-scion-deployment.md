@@ -49,6 +49,8 @@ docker compose up -d --build
 
 First build takes a few minutes on Raspberry Pi.
 
+**Auto-start is enabled by default!** The container will automatically start on boot thanks to the `restart: unless-stopped` policy in docker-compose.yml.
+
 ### Verify
 
 ```bash
@@ -64,9 +66,31 @@ curl http://localhost:3000/health
 
 Expected response: `{"status":"ok"}`
 
-## Configure Auto-Start
+## Auto-Start Configuration
 
-### Install Systemd Service
+### Method 1: Docker Compose Restart Policy (Enabled by Default)
+
+The `docker-compose.yml` already includes `restart: unless-stopped`, which means:
+- Container starts automatically when Docker daemon starts
+- Container restarts if it crashes
+- Container only stops when explicitly stopped with `docker compose down` or `docker stop`
+
+**This is the recommended approach** - no additional setup needed!
+
+To verify:
+```bash
+# Check restart policy
+docker inspect scion-sync | grep -i restart
+
+# Test by rebooting
+sudo reboot
+# After reboot, check container is running
+docker compose ps
+```
+
+### Method 2: Systemd Service (Optional)
+
+For additional control via systemd (not required if using Method 1):
 
 ```bash
 sudo cp scion-sync.service /etc/systemd/system/
@@ -74,8 +98,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable scion-sync
 ```
 
-### Manage the Service
-
+Manage the service:
 ```bash
 # Start
 sudo systemctl start scion-sync
@@ -88,25 +111,30 @@ sudo systemctl restart scion-sync
 
 # Status
 sudo systemctl status scion-sync
+
+# View logs
+sudo journalctl -u scion-sync -f
 ```
+
+**Note:** Using both methods simultaneously is fine. The systemd service will use `docker compose` which respects the restart policy.
 
 ## Configure Obsidian Plugin
 
-In Obsidian, install the Scion Sync plugin and configure:
+Your server is now running! Next, install and configure the Obsidian plugin to connect your vault.
 
-**Server URL:**
-```
-# If on same network
-http://scion-pi.local:3000
+**Quick connection URLs:**
+- Same network: `http://scion-pi.local:3000`
+- Tailscale (recommended): `http://scion-pi:3000`
+- Tailscale IP: `http://100.x.y.z:3000`
 
-# Via Tailscale (recommended)
-http://scion-pi:3000
+For complete plugin installation and configuration instructions, see:
+**[06a - Obsidian Plugin Setup](./06a-obsidian-plugin.md)**
 
-# Or using Tailscale IP
-http://100.x.y.z:3000
-```
-
-**Vault Name:** Choose a name for your vault (e.g., `MyNotes`)
+The guide covers:
+- Plugin installation steps
+- Detailed configuration options
+- Connection testing and troubleshooting
+- Sync settings and conflict resolution
 
 ## Updating
 
@@ -311,6 +339,7 @@ VAULT_HOST_PATH=/mnt/ssd/scion-vault
 
 Your Scion Sync server is now running!
 
-- Configure Obsidian plugin to connect
-- Set up [Tailscale](./03-tailscale.md) for remote access
-- Check [Optional Tools](./06-optional-tools.md) for monitoring
+Continue with:
+- [06a - Obsidian Plugin Setup](./06a-obsidian-plugin.md) - Connect your Obsidian vault
+- [03 - Tailscale](./03-tailscale.md) - Set up remote access (if not done yet)
+- [06 - Optional Tools](./06-optional-tools.md) - Monitoring and management tools
