@@ -14,7 +14,7 @@ services:
       - PORT=3000
       - HOST=0.0.0.0
       - LOG_LEVEL=${LOG_LEVEL:-info}
-      - VAULT_PATH=/home/lavishmantri/scion-vault
+      - VAULT_PATH=/data/vault
 
     volumes:
       # Mount host vault directory to container
