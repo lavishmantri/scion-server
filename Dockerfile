@@ -50,7 +50,7 @@ ENV NODE_ENV=production \
     PORT=3000 \
     HOST=0.0.0.0 \
     LOG_LEVEL=info \
-    VAULT_PATH=/home/lavishmantri/scion-vault
+    VAULT_PATH=/data/vault
 
 # Switch to non-root user
 USER scion

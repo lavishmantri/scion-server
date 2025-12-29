@@ -20,8 +20,12 @@ cd scion/server
 ### Create Vault Directory
 
 ```bash
-mkdir -p /home/pi/scion-vault
+mkdir -p /home/lavishmantri/scion-vault
+# Set ownership for container user (uid 1001)
+sudo chown -R 1001:1001 /home/lavishmantri/scion-vault
 ```
+
+**Why uid 1001?** The container runs as the `scion` user (uid 1001) for security. The vault directory needs to be writable by this user.
 
 ### Configure Environment
 
@@ -38,8 +42,10 @@ Default configuration:
 ```bash
 PORT=3000
 LOG_LEVEL=info
-VAULT_HOST_PATH=/home/pi/scion-vault
+VAULT_HOST_PATH=/home/lavishmantri/scion-vault
 ```
+
+**Note:** Replace `lavishmantri` with your actual username on the Pi.
 
 ### Build and Start
 
@@ -248,10 +254,19 @@ docker compose up
 
 ### Permission Issues
 
+**Error**: `EACCES: permission denied, mkdir '/data/vault/...'`
+
+This means the container can't write to the vault directory. Fix with:
+
 ```bash
-# Fix vault directory permissions
-sudo chown -R 1001:1001 /home/pi/scion-vault
+# Fix vault directory permissions (replace with your username)
+sudo chown -R 1001:1001 /home/lavishmantri/scion-vault
+
+# Restart container
+docker compose restart
 ```
+
+**Why 1001?** The container runs as user `scion` (uid 1001) for security. The vault directory must be owned by this user.
 
 ### Port Already in Use
 
