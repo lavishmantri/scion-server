@@ -637,26 +637,28 @@ interface WsQuery {
   deviceId?: string;
 }
 
-server.get<{ Params: VaultParams; Querystring: WsQuery }>(
-  '/vault/:vaultName/ws',
-  { websocket: true },
-  (socket, request) => {
-    const { vaultName } = request.params;
-    const deviceId = request.query.deviceId || `device-${Date.now()}`;
+server.register(async function (fastify) {
+  fastify.get<{ Params: VaultParams; Querystring: WsQuery }>(
+    '/vault/:vaultName/ws',
+    { websocket: true },
+    (socket, request) => {
+      const { vaultName } = request.params;
+      const deviceId = request.query.deviceId || `device-${Date.now()}`;
 
-    if (!validateVaultName(vaultName)) {
-      console.log(`[WS] Rejected connection: invalid vault name "${vaultName}"`);
-      socket.close(1008, 'Invalid vault name');
-      return;
+      if (!validateVaultName(vaultName)) {
+        console.log(`[WS] Rejected connection: invalid vault name "${vaultName}"`);
+        socket.close(1008, 'Invalid vault name');
+        return;
+      }
+
+      console.log(`Server: WebSocket connection for vault="${vaultName}" device="${deviceId}"`);
+      initVaultGit(vaultName);
+
+      // Hand off to WebSocket manager
+      wsManager.handleConnection(socket, vaultName, deviceId);
     }
-
-    console.log(`Server: WebSocket connection for vault="${vaultName}" device="${deviceId}"`);
-    initVaultGit(vaultName);
-
-    // Hand off to WebSocket manager
-    wsManager.handleConnection(socket, vaultName, deviceId);
-  }
-);
+  );
+});
 
 // WebSocket status endpoint (for debugging)
 server.get('/ws/status', async () => {
