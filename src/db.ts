@@ -3,6 +3,19 @@ import path from 'path';
 import fse from 'fs-extra';
 import { createHash } from 'crypto';
 import { config } from './config.js';
+import {
+  getDatabase,
+  ensureFileId,
+  getFileByPath,
+  getFileById,
+  updateFileRecord,
+  recordPathChange,
+  softDeleteFile,
+  getAllPreviousPaths,
+  detectRenameByHash,
+  updateGitManifest,
+  isVaultBootstrapped,
+} from './metadata.js';
 
 // Support absolute paths or resolve relative paths from cwd
 export const VAULT_ROOT = path.isAbsolute(config.vaultPath)
@@ -10,6 +23,7 @@ export const VAULT_ROOT = path.isAbsolute(config.vaultPath)
   : path.resolve(process.cwd(), config.vaultPath);
 
 export interface FileRecord {
+  file_id: string;  // UUID - persistent identity that survives renames
   path: string;
   hash: string;
   commit: string;
@@ -91,7 +105,14 @@ export function initVaultGit(vaultName: string): void {
   execSync('git config user.name "Scion Sync"', { cwd: vaultPath, stdio: 'pipe' });
 
   // Create .gitignore
-  const gitignore = '.DS_Store\nThumbs.db\n';
+  // Note: .scion/manifest.json is tracked for disaster recovery
+  // SQLite database and WAL files are ignored
+  const gitignore = `.DS_Store
+Thumbs.db
+.scion/metadata.db
+.scion/metadata.db-wal
+.scion/metadata.db-shm
+`;
   fse.writeFileSync(path.join(vaultPath, '.gitignore'), gitignore);
 
   // Initial commit
@@ -262,6 +283,59 @@ export function deleteFile(vaultName: string, filePath: string): boolean {
 }
 
 /**
+ * Bootstrap vault metadata - generates UUIDs for all existing files
+ * Called automatically during getManifest if metadata doesn't exist
+ */
+export function bootstrapVaultMetadata(vaultName: string): void {
+  console.log(`Bootstrapping metadata for vault "${vaultName}"...`);
+
+  const vaultPath = getVaultPath(vaultName);
+
+  // Get list of tracked files
+  let files: string[];
+  try {
+    const output = git(vaultName, 'ls-files');
+    files = output.split('\n').filter((f) => f && f !== '.gitignore' && !f.startsWith('.scion/'));
+  } catch {
+    files = [];
+  }
+
+  // Initialize the database (creates tables)
+  getDatabase(vaultName);
+
+  for (const filePath of files) {
+    const fullPath = path.join(vaultPath, filePath);
+    if (!fse.existsSync(fullPath)) continue;
+
+    const content = fse.readFileSync(fullPath);
+    const hash = computeHash(content);
+
+    let commit: string | null = null;
+    try {
+      commit = git(vaultName, `log -1 --format=%H -- "${filePath}"`);
+    } catch {
+      // File might not be committed yet
+    }
+
+    // This will create a new UUID if one doesn't exist
+    ensureFileId(vaultName, filePath, hash, commit);
+  }
+
+  // Persist UUID mapping to Git for disaster recovery
+  updateGitManifest(vaultName);
+
+  // Commit the manifest file
+  try {
+    git(vaultName, 'add .scion/manifest.json');
+    git(vaultName, 'commit -m "Initialize Scion metadata"');
+  } catch {
+    // Might already be committed or nothing to commit
+  }
+
+  console.log(`Bootstrapped ${files.length} files for vault "${vaultName}"`);
+}
+
+/**
  * Get manifest of all files in the vault
  */
 export function getManifest(vaultName: string): FileRecord[] {
@@ -278,9 +352,14 @@ export function getManifest(vaultName: string): FileRecord[] {
   let files: string[];
   try {
     const output = git(vaultName, 'ls-files');
-    files = output.split('\n').filter((f) => f && f !== '.gitignore');
+    files = output.split('\n').filter((f) => f && f !== '.gitignore' && !f.startsWith('.scion/'));
   } catch {
     return [];
+  }
+
+  // Check if we need to bootstrap metadata (only once per vault)
+  if (files.length > 0 && !isVaultBootstrapped(vaultName)) {
+    bootstrapVaultMetadata(vaultName);
   }
 
   const records: FileRecord[] = [];
@@ -310,7 +389,11 @@ export function getManifest(vaultName: string): FileRecord[] {
       commit = headCommit;
     }
 
+    // Get or create file_id from metadata store
+    const fileId = ensureFileId(vaultName, filePath, hash, commit);
+
     records.push({
+      file_id: fileId,
       path: filePath,
       hash,
       commit,
@@ -383,7 +466,11 @@ export function getFileRecord(vaultName: string, filePath: string): FileRecord |
     updatedAt = Math.floor(Date.now() / 1000);
   }
 
+  // Get or create file_id from metadata store
+  const fileId = ensureFileId(vaultName, filePath, hash, commit);
+
   return {
+    file_id: fileId,
     path: filePath,
     hash,
     commit,
@@ -396,4 +483,165 @@ export function getFileRecord(vaultName: string, filePath: string): FileRecord |
  */
 export function computeHash(content: Buffer): string {
   return createHash('sha256').update(content).digest('hex');
+}
+
+/**
+ * Detect if a missing file was renamed
+ * Returns the new location if found
+ */
+export function detectRename(
+  vaultName: string,
+  missingPath: string,
+  contentHash: string,
+  fileId?: string
+): { found: boolean; newPath?: string; fileId?: string; method?: string } {
+  // Strategy 1: If file_id provided, check metadata for current path
+  if (fileId) {
+    const metadata = getFileById(vaultName, fileId);
+    if (metadata && metadata.current_path !== missingPath && !metadata.deleted_at) {
+      return {
+        found: true,
+        newPath: metadata.current_path,
+        fileId: metadata.file_id,
+        method: 'file_id',
+      };
+    }
+  }
+
+  // Strategy 2: Check hash index for exact content match
+  const matchedFile = detectRenameByHash(vaultName, missingPath, contentHash);
+  if (matchedFile) {
+    return {
+      found: true,
+      newPath: matchedFile.current_path,
+      fileId: matchedFile.file_id,
+      method: 'hash_match',
+    };
+  }
+
+  // Strategy 3: Check path history (file might have been renamed multiple times)
+  const vaultPath = getVaultPath(vaultName);
+
+  // First get all files and check their path history
+  const allFiles = getManifest(vaultName);
+  for (const file of allFiles) {
+    const previousPaths = getAllPreviousPaths(vaultName, file.file_id);
+    if (previousPaths.includes(missingPath)) {
+      return {
+        found: true,
+        newPath: file.path,
+        fileId: file.file_id,
+        method: 'path_history',
+      };
+    }
+  }
+
+  return { found: false };
+}
+
+/**
+ * Rename a file atomically using git mv
+ * Returns the new commit hash and updated file record
+ */
+export function renameFile(
+  vaultName: string,
+  fileId: string,
+  oldPath: string,
+  newPath: string,
+  newContent?: Buffer
+): { success: boolean; commit: string; error?: string } {
+  initVaultGit(vaultName);
+
+  const vaultPath = getVaultPath(vaultName);
+  const oldFullPath = path.join(vaultPath, oldPath);
+  const newFullPath = path.join(vaultPath, newPath);
+
+  // Verify the file exists at old path
+  if (!fse.existsSync(oldFullPath)) {
+    return { success: false, commit: '', error: 'File not found at old path' };
+  }
+
+  // Verify file_id matches
+  const metadata = getFileById(vaultName, fileId);
+  if (!metadata) {
+    return { success: false, commit: '', error: 'File ID not found in metadata' };
+  }
+
+  if (metadata.current_path !== oldPath) {
+    return { success: false, commit: '', error: 'File ID does not match old path' };
+  }
+
+  try {
+    // Ensure parent directory of new path exists
+    fse.ensureDirSync(path.dirname(newFullPath));
+
+    // Use git mv for proper rename tracking
+    git(vaultName, `mv "${oldPath}" "${newPath}"`);
+
+    // If new content provided, write it
+    if (newContent) {
+      fse.writeFileSync(newFullPath, newContent);
+      git(vaultName, `add "${newPath}"`);
+    }
+
+    // Commit the rename
+    git(vaultName, `commit -m "Rename ${oldPath} to ${newPath}"`);
+
+    const commit = getHeadCommit(vaultName) || '';
+    const hash = newContent
+      ? computeHash(newContent)
+      : computeHash(fse.readFileSync(newFullPath));
+
+    // Update metadata
+    recordPathChange(vaultName, fileId, oldPath, newPath);
+    updateFileRecord(vaultName, fileId, {
+      current_path: newPath,
+      content_hash: hash,
+      git_commit: commit,
+    });
+
+    // Update Git manifest for disaster recovery
+    updateGitManifest(vaultName);
+
+    // Commit the updated manifest
+    try {
+      git(vaultName, 'add .scion/manifest.json');
+      git(vaultName, 'commit --amend --no-edit');
+    } catch {
+      // Might fail if manifest unchanged
+    }
+
+    return { success: true, commit };
+  } catch (error: unknown) {
+    const execError = error as { message?: string };
+    return { success: false, commit: '', error: execError.message || 'Unknown error' };
+  }
+}
+
+/**
+ * Get file at a commit, searching through path history if needed
+ * Useful for three-way merge when file has been renamed
+ */
+export function getFileAtCommitWithHistory(
+  vaultName: string,
+  fileId: string,
+  commitHash: string,
+  currentPath: string
+): Buffer | null {
+  // First try the current path
+  const content = getFileAtCommit(vaultName, currentPath, commitHash);
+  if (content) {
+    return content;
+  }
+
+  // Try all previous paths
+  const previousPaths = getAllPreviousPaths(vaultName, fileId);
+  for (const prevPath of previousPaths) {
+    const prevContent = getFileAtCommit(vaultName, prevPath, commitHash);
+    if (prevContent) {
+      return prevContent;
+    }
+  }
+
+  return null;
 }

@@ -138,4 +138,5 @@ build/
 
 # Scion specific
 sync.db
-/Users/lavishmantri/Projects/scion/server/node_modules/
+vault/
+data/

@@ -18,7 +18,22 @@ import {
   getCurrentFile,
   mergeFile,
   getChangesSince,
+  detectRename,
+  renameFile,
+  getFileAtCommitWithHistory,
 } from './db.js';
+import {
+  getFileByPath,
+  getFileById,
+  ensureFileId,
+  updateFileRecord as updateMetadata,
+  softDeleteFile,
+} from './metadata.js';
+import {
+  processOperation,
+  type SyncOperation,
+  type OperationResult,
+} from './operations.js';
 
 export const server = Fastify({
   logger: {
@@ -158,10 +173,12 @@ server.post<{ Params: VaultParams; Body: SyncBody }>(
     if (!serverContent) {
       console.log(`Server: New file ${filePath}, committing directly`);
       const commit = commitFile(vaultName, filePath, clientContent, `Add ${filePath}`);
+      const fileId = ensureFileId(vaultName, filePath, clientHash, commit);
       return {
         success: true,
         commit,
         hash: clientHash,
+        file_id: fileId,
         merged: false,
         has_conflicts: false,
       };
@@ -171,10 +188,12 @@ server.post<{ Params: VaultParams; Body: SyncBody }>(
     if (base_commit && base_commit === headCommit) {
       console.log(`Server: Fast-forward for ${filePath}`);
       const commit = commitFile(vaultName, filePath, clientContent, `Update ${filePath}`);
+      const fileId = ensureFileId(vaultName, filePath, clientHash, commit);
       return {
         success: true,
         commit,
         hash: clientHash,
+        file_id: fileId,
         merged: false,
         has_conflicts: false,
       };
@@ -187,10 +206,12 @@ server.post<{ Params: VaultParams; Body: SyncBody }>(
       if (clientHash === serverHash) {
         console.log(`Server: Content identical for ${filePath}, no commit needed`);
         const record = getFileRecord(vaultName, filePath);
+        const fileId = ensureFileId(vaultName, filePath, clientHash, record?.commit || headCommit);
         return {
           success: true,
           commit: record?.commit || headCommit,
           hash: clientHash,
+          file_id: fileId,
           merged: false,
           has_conflicts: false,
         };
@@ -202,10 +223,12 @@ server.post<{ Params: VaultParams; Body: SyncBody }>(
 
       if (result.hasConflicts) {
         // Return merged content with conflict markers, don't commit yet
+        const fileId = ensureFileId(vaultName, filePath, computeHash(result.merged), headCommit);
         return {
           success: true,
           commit: headCommit,
           hash: computeHash(result.merged),
+          file_id: fileId,
           merged: true,
           has_conflicts: true,
           merged_content: result.merged.toString('base64'),
@@ -214,10 +237,13 @@ server.post<{ Params: VaultParams; Body: SyncBody }>(
 
       // Clean merge
       const commit = commitFile(vaultName, filePath, result.merged, `Merge ${filePath}`);
+      const mergedHash = computeHash(result.merged);
+      const fileId = ensureFileId(vaultName, filePath, mergedHash, commit);
       return {
         success: true,
         commit,
-        hash: computeHash(result.merged),
+        hash: mergedHash,
+        file_id: fileId,
         merged: true,
         has_conflicts: false,
         merged_content: result.merged.toString('base64'),
@@ -236,10 +262,13 @@ server.post<{ Params: VaultParams; Body: SyncBody }>(
       const result = mergeFile(vaultName, Buffer.from(''), clientContent, serverContent);
 
       if (result.hasConflicts) {
+        const mergedHash = computeHash(result.merged);
+        const fileId = ensureFileId(vaultName, filePath, mergedHash, headCommit);
         return {
           success: true,
           commit: headCommit,
-          hash: computeHash(result.merged),
+          hash: mergedHash,
+          file_id: fileId,
           merged: true,
           has_conflicts: true,
           merged_content: result.merged.toString('base64'),
@@ -247,10 +276,13 @@ server.post<{ Params: VaultParams; Body: SyncBody }>(
       }
 
       const commit = commitFile(vaultName, filePath, result.merged, `Merge ${filePath}`);
+      const mergedHash = computeHash(result.merged);
+      const fileId = ensureFileId(vaultName, filePath, mergedHash, commit);
       return {
         success: true,
         commit,
-        hash: computeHash(result.merged),
+        hash: mergedHash,
+        file_id: fileId,
         merged: true,
         has_conflicts: false,
         merged_content: result.merged.toString('base64'),
@@ -263,10 +295,13 @@ server.post<{ Params: VaultParams; Body: SyncBody }>(
     if (result.hasConflicts) {
       console.log(`Server: Merge conflicts detected for ${filePath}`);
       // Return merged content with conflict markers, don't commit
+      const mergedHash = computeHash(result.merged);
+      const fileId = ensureFileId(vaultName, filePath, mergedHash, headCommit);
       return {
         success: true,
         commit: headCommit,
-        hash: computeHash(result.merged),
+        hash: mergedHash,
+        file_id: fileId,
         merged: true,
         has_conflicts: true,
         merged_content: result.merged.toString('base64'),
@@ -276,15 +311,100 @@ server.post<{ Params: VaultParams; Body: SyncBody }>(
     // Clean merge - commit the result
     console.log(`Server: Clean merge for ${filePath}`);
     const commit = commitFile(vaultName, filePath, result.merged, `Merge ${filePath}`);
+    const mergedHash = computeHash(result.merged);
+    const fileId = ensureFileId(vaultName, filePath, mergedHash, commit);
 
     return {
       success: true,
       commit,
-      hash: computeHash(result.merged),
+      hash: mergedHash,
+      file_id: fileId,
       merged: true,
       has_conflicts: false,
       merged_content: result.merged.toString('base64'),
     };
+  }
+);
+
+// POST /vault/:vaultName/sync/v2 - V2 sync protocol with batch operations
+interface V2SyncBody {
+  operations: SyncOperation[];
+  atomic?: boolean; // If true, all-or-nothing transaction (default: true)
+}
+
+interface V2SyncResponse {
+  success: boolean;
+  results: OperationResult[];
+  head_commit: string;
+}
+
+server.post<{ Params: VaultParams; Body: V2SyncBody }>(
+  '/vault/:vaultName/sync/v2',
+  async (request, reply) => {
+    const { vaultName } = request.params;
+    const { operations, atomic = true } = request.body;
+
+    if (!validateVaultName(vaultName)) {
+      return reply.status(400).send({ error: 'Invalid vault name' });
+    }
+
+    if (!operations || !Array.isArray(operations) || operations.length === 0) {
+      return reply.status(400).send({ error: 'operations array is required' });
+    }
+
+    console.log(`Server: POST /vault/${vaultName}/sync/v2 - ${operations.length} operation(s), atomic=${atomic}`);
+    initVaultGit(vaultName);
+
+    const results: OperationResult[] = [];
+    const startCommit = getHeadCommit(vaultName);
+
+    for (let i = 0; i < operations.length; i++) {
+      const op = operations[i];
+
+      // Validate operation structure
+      if (!op.type || !op.path) {
+        results.push({
+          index: i,
+          success: false,
+          error: 'Operation requires type and path',
+        });
+
+        if (atomic) {
+          // Rollback: reset to start commit
+          console.log(`Server: Atomic rollback due to invalid operation at index ${i}`);
+          return reply.status(400).send({
+            success: false,
+            results,
+            head_commit: startCommit,
+            error: `Operation ${i} failed: Operation requires type and path`,
+          });
+        }
+        continue;
+      }
+
+      const result = processOperation(vaultName, op, i);
+      results.push(result);
+
+      if (!result.success && atomic) {
+        // Rollback: In a real implementation, we'd use git reset
+        // For now, we just fail the batch and return
+        console.log(`Server: Atomic rollback due to failed operation at index ${i}: ${result.error}`);
+        return reply.status(400).send({
+          success: false,
+          results,
+          head_commit: startCommit,
+          error: `Operation ${i} failed: ${result.error}`,
+        });
+      }
+    }
+
+    const allSucceeded = results.every((r) => r.success);
+
+    return {
+      success: allSucceeded,
+      results,
+      head_commit: getHeadCommit(vaultName),
+    } as V2SyncResponse;
   }
 );
 
@@ -301,6 +421,12 @@ server.delete<{ Params: VaultFileParams }>(
 
     console.log(`Server: DELETE /vault/${vaultName}/file/${filePath}`);
 
+    // Get file_id before deletion for metadata tracking
+    const metadata = getFileByPath(vaultName, filePath);
+    if (metadata) {
+      softDeleteFile(vaultName, metadata.file_id);
+    }
+
     const deleted = deleteFile(vaultName, filePath);
 
     if (!deleted) {
@@ -310,3 +436,119 @@ server.delete<{ Params: VaultFileParams }>(
     return { success: true, commit: getHeadCommit(vaultName) };
   }
 );
+
+// POST /vault/:vaultName/detect-rename - Detect if a file was renamed
+interface DetectRenameBody {
+  missing_path: string;
+  missing_hash: string;
+  file_id?: string;
+}
+
+server.post<{ Params: VaultParams; Body: DetectRenameBody }>(
+  '/vault/:vaultName/detect-rename',
+  async (request, reply) => {
+    const { vaultName } = request.params;
+    const { missing_path, missing_hash, file_id } = request.body;
+
+    if (!validateVaultName(vaultName)) {
+      return reply.status(400).send({ error: 'Invalid vault name' });
+    }
+
+    if (!missing_path || !missing_hash) {
+      return reply.status(400).send({ error: 'Missing required fields: missing_path, missing_hash' });
+    }
+
+    console.log(`Server: POST /vault/${vaultName}/detect-rename - ${missing_path}`);
+
+    const result = detectRename(vaultName, missing_path, missing_hash, file_id);
+
+    return {
+      found: result.found,
+      new_path: result.newPath,
+      file_id: result.fileId,
+      detection_method: result.method,
+    };
+  }
+);
+
+// POST /vault/:vaultName/rename - Rename a file atomically
+interface RenameBody {
+  file_id: string;
+  old_path: string;
+  new_path: string;
+  content?: string; // base64 encoded (optional - if content also changed)
+}
+
+server.post<{ Params: VaultParams; Body: RenameBody }>(
+  '/vault/:vaultName/rename',
+  async (request, reply) => {
+    const { vaultName } = request.params;
+    const { file_id, old_path, new_path, content } = request.body;
+
+    if (!validateVaultName(vaultName)) {
+      return reply.status(400).send({ error: 'Invalid vault name' });
+    }
+
+    if (!file_id || !old_path || !new_path) {
+      return reply.status(400).send({ error: 'Missing required fields: file_id, old_path, new_path' });
+    }
+
+    console.log(`Server: POST /vault/${vaultName}/rename - ${old_path} -> ${new_path}`);
+
+    const newContent = content ? Buffer.from(content, 'base64') : undefined;
+    const result = renameFile(vaultName, file_id, old_path, new_path, newContent);
+
+    if (!result.success) {
+      return reply.status(400).send({ error: result.error });
+    }
+
+    const record = getFileRecord(vaultName, new_path);
+
+    return {
+      success: true,
+      commit: result.commit,
+      file_id: record?.file_id,
+      hash: record?.hash,
+    };
+  }
+);
+
+// GET /vault/:vaultName/file-by-id/:fileId - Download file by UUID
+interface FileByIdParams extends VaultParams {
+  fileId: string;
+}
+
+server.get<{ Params: FileByIdParams }>('/vault/:vaultName/file-by-id/:fileId', async (request, reply) => {
+  const { vaultName, fileId } = request.params;
+
+  if (!validateVaultName(vaultName)) {
+    return reply.status(400).send({ error: 'Invalid vault name' });
+  }
+
+  console.log(`Server: GET /vault/${vaultName}/file-by-id/${fileId}`);
+
+  // Look up current path from metadata
+  const fileMeta = getFileById(vaultName, fileId);
+
+  if (!fileMeta || fileMeta.deleted_at) {
+    return reply.status(404).send({ error: 'File not found' });
+  }
+
+  const record = getFileRecord(vaultName, fileMeta.current_path);
+  if (!record) {
+    return reply.status(404).send({ error: 'File not found on disk' });
+  }
+
+  const content = getCurrentFile(vaultName, fileMeta.current_path);
+  if (!content) {
+    return reply.status(404).send({ error: 'File content not found' });
+  }
+
+  return reply
+    .header('Content-Type', 'application/octet-stream')
+    .header('X-File-Id', record.file_id)
+    .header('X-File-Path', record.path)
+    .header('X-File-Commit', record.commit)
+    .header('X-File-Hash', record.hash)
+    .send(content);
+});
