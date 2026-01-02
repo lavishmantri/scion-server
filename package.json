@@ -15,11 +15,13 @@
   "license": "ISC",
   "dependencies": {
     "@fastify/cors": "^11.2.0",
+    "@fastify/websocket": "^11.2.0",
     "better-sqlite3": "^12.5.0",
     "fastify": "^5.6.2",
     "fs-extra": "^11.3.3",
     "simple-git": "^3.30.0",
-    "uuid": "^13.0.0"
+    "uuid": "^13.0.0",
+    "yjs": "^13.6.28"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",

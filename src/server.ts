@@ -1,7 +1,9 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
+import websocket from '@fastify/websocket';
 import path from 'path';
 import fse from 'fs-extra';
+import { wsManager, type WebSocketMessage } from './websocket.js';
 import { config } from './config.js';
 import {
   VAULT_ROOT,
@@ -47,6 +49,9 @@ await server.register(cors, {
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
 });
 
+// Register WebSocket plugin
+await server.register(websocket);
+
 // Ensure vault root directory exists
 await fse.ensureDir(VAULT_ROOT);
 
@@ -77,7 +82,39 @@ server.get<{ Params: VaultParams }>('/vault/:vaultName/manifest', async (request
   const files = getManifest(vaultName);
   const headCommit = getHeadCommit(vaultName);
 
+  // Debug logging for sync troubleshooting
+  console.log(`[SYNC DEBUG] vault="${vaultName}" endpoint="/manifest"
+  server_head="${headCommit}" file_count=${files.length}`);
+
   return { files, head_commit: headCommit };
+});
+
+// GET /vault/:vaultName/debug - Debug endpoint to check vault state
+server.get<{ Params: VaultParams }>('/vault/:vaultName/debug', async (request, reply) => {
+  const { vaultName } = request.params;
+
+  if (!validateVaultName(vaultName)) {
+    return reply.status(400).send({ error: 'Invalid vault name' });
+  }
+
+  initVaultGit(vaultName);
+  const files = getManifest(vaultName);
+  const headCommit = getHeadCommit(vaultName);
+
+  // Get the latest file update time
+  let lastModified: number | null = null;
+  for (const file of files) {
+    if (!lastModified || file.updated_at > lastModified) {
+      lastModified = file.updated_at;
+    }
+  }
+
+  return {
+    vault_name: vaultName,
+    head_commit: headCommit,
+    file_count: files.length,
+    last_modified: lastModified ? new Date(lastModified * 1000).toISOString() : null,
+  };
 });
 
 // GET /vault/:vaultName/status - Get changes since a commit (for polling)
@@ -100,6 +137,11 @@ server.get<{ Params: VaultParams; Querystring: StatusQuery }>(
 
     const { headCommit, changedFiles } = getChangesSince(vaultName, since || null);
 
+    // Debug logging for sync troubleshooting
+    console.log(`[SYNC DEBUG] vault="${vaultName}" endpoint="/status"
+  client_since="${since || 'null'}" server_head="${headCommit}"
+  commits_match=${since === headCommit} changed_files=${changedFiles.length > 0 ? JSON.stringify(changedFiles) : '[]'}`);
+
     return {
       head_commit: headCommit,
       changed_files: changedFiles,
@@ -121,14 +163,20 @@ server.get<{ Params: VaultFileParams }>('/vault/:vaultName/file/*', async (reque
   const record = getFileRecord(vaultName, filePath);
 
   if (!record) {
+    console.log(`[SYNC DEBUG] vault="${vaultName}" endpoint="/file" path="${filePath}" status="not_found"`);
     return reply.status(404).send({ error: 'File not found' });
   }
 
   const content = getCurrentFile(vaultName, filePath);
 
   if (!content) {
+    console.log(`[SYNC DEBUG] vault="${vaultName}" endpoint="/file" path="${filePath}" status="not_on_disk"`);
     return reply.status(404).send({ error: 'File not found on disk' });
   }
+
+  // Debug logging for sync troubleshooting
+  console.log(`[SYNC DEBUG] vault="${vaultName}" endpoint="/file" path="${filePath}"
+  commit="${record.commit}" hash="${record.hash}" size=${content.length}`);
 
   return reply
     .header('Content-Type', 'application/octet-stream')
@@ -169,11 +217,19 @@ server.post<{ Params: VaultParams; Body: SyncBody }>(
     const headCommit = getHeadCommit(vaultName);
     const serverContent = getCurrentFile(vaultName, filePath);
 
+    // Debug logging for upload troubleshooting
+    console.log(`[SYNC DEBUG] vault="${vaultName}" endpoint="/sync" UPLOAD_RECEIVED
+  path="${filePath}" content_size=${clientContent.length} client_hash="${clientHash}"
+  base_commit="${base_commit || 'null'}" server_head="${headCommit}"
+  file_exists_on_server=${serverContent !== null}`);
+
     // Case 1: New file (doesn't exist on server)
     if (!serverContent) {
       console.log(`Server: New file ${filePath}, committing directly`);
       const commit = commitFile(vaultName, filePath, clientContent, `Add ${filePath}`);
       const fileId = ensureFileId(vaultName, filePath, clientHash, commit);
+      console.log(`[SYNC DEBUG] vault="${vaultName}" COMMIT_CREATED case="new_file"
+  path="${filePath}" new_commit="${commit}"`);
       return {
         success: true,
         commit,
@@ -189,6 +245,8 @@ server.post<{ Params: VaultParams; Body: SyncBody }>(
       console.log(`Server: Fast-forward for ${filePath}`);
       const commit = commitFile(vaultName, filePath, clientContent, `Update ${filePath}`);
       const fileId = ensureFileId(vaultName, filePath, clientHash, commit);
+      console.log(`[SYNC DEBUG] vault="${vaultName}" COMMIT_CREATED case="fast_forward"
+  path="${filePath}" new_commit="${commit}"`);
       return {
         success: true,
         commit,
@@ -207,6 +265,9 @@ server.post<{ Params: VaultParams; Body: SyncBody }>(
         console.log(`Server: Content identical for ${filePath}, no commit needed`);
         const record = getFileRecord(vaultName, filePath);
         const fileId = ensureFileId(vaultName, filePath, clientHash, record?.commit || headCommit);
+        console.log(`[SYNC DEBUG] vault="${vaultName}" NO_COMMIT_NEEDED case="content_identical"
+  path="${filePath}" client_hash="${clientHash}" server_hash="${serverHash}"
+  returning_commit="${record?.commit || headCommit}"`);
         return {
           success: true,
           commit: record?.commit || headCommit,
@@ -239,6 +300,8 @@ server.post<{ Params: VaultParams; Body: SyncBody }>(
       const commit = commitFile(vaultName, filePath, result.merged, `Merge ${filePath}`);
       const mergedHash = computeHash(result.merged);
       const fileId = ensureFileId(vaultName, filePath, mergedHash, commit);
+      console.log(`[SYNC DEBUG] vault="${vaultName}" COMMIT_CREATED case="merge_no_base"
+  path="${filePath}" new_commit="${commit}"`);
       return {
         success: true,
         commit,
@@ -313,6 +376,8 @@ server.post<{ Params: VaultParams; Body: SyncBody }>(
     const commit = commitFile(vaultName, filePath, result.merged, `Merge ${filePath}`);
     const mergedHash = computeHash(result.merged);
     const fileId = ensureFileId(vaultName, filePath, mergedHash, commit);
+    console.log(`[SYNC DEBUG] vault="${vaultName}" COMMIT_CREATED case="three_way_merge"
+  path="${filePath}" new_commit="${commit}"`);
 
     return {
       success: true,
@@ -358,6 +423,12 @@ server.post<{ Params: VaultParams; Body: V2SyncBody }>(
     const results: OperationResult[] = [];
     const startCommit = getHeadCommit(vaultName);
 
+    // Debug logging for V2 upload troubleshooting
+    const opSummary = operations.map((op, i) => `${i}:${op.type}:${op.path}`).join(', ');
+    console.log(`[SYNC DEBUG] vault="${vaultName}" endpoint="/sync/v2" UPLOAD_RECEIVED
+  operation_count=${operations.length} atomic=${atomic} server_head="${startCommit}"
+  operations=[${opSummary}]`);
+
     for (let i = 0; i < operations.length; i++) {
       const op = operations[i];
 
@@ -399,11 +470,19 @@ server.post<{ Params: VaultParams; Body: V2SyncBody }>(
     }
 
     const allSucceeded = results.every((r) => r.success);
+    const finalCommit = getHeadCommit(vaultName);
+
+    // Debug logging for V2 completion
+    const successCount = results.filter((r) => r.success).length;
+    console.log(`[SYNC DEBUG] vault="${vaultName}" endpoint="/sync/v2" COMPLETED
+  success=${allSucceeded} operations_succeeded=${successCount}/${results.length}
+  start_commit="${startCommit}" final_commit="${finalCommit}"
+  commit_changed=${startCommit !== finalCommit}`);
 
     return {
       success: allSucceeded,
       results,
-      head_commit: getHeadCommit(vaultName),
+      head_commit: finalCommit,
     } as V2SyncResponse;
   }
 );
@@ -552,3 +631,47 @@ server.get<{ Params: FileByIdParams }>('/vault/:vaultName/file-by-id/:fileId', a
     .header('X-File-Hash', record.hash)
     .send(content);
 });
+
+// WebSocket endpoint for real-time sync
+interface WsQuery {
+  deviceId?: string;
+}
+
+server.get<{ Params: VaultParams; Querystring: WsQuery }>(
+  '/vault/:vaultName/ws',
+  { websocket: true },
+  (socket, request) => {
+    const { vaultName } = request.params;
+    const deviceId = request.query.deviceId || `device-${Date.now()}`;
+
+    if (!validateVaultName(vaultName)) {
+      console.log(`[WS] Rejected connection: invalid vault name "${vaultName}"`);
+      socket.close(1008, 'Invalid vault name');
+      return;
+    }
+
+    console.log(`Server: WebSocket connection for vault="${vaultName}" device="${deviceId}"`);
+    initVaultGit(vaultName);
+
+    // Hand off to WebSocket manager
+    wsManager.handleConnection(socket, vaultName, deviceId);
+  }
+);
+
+// WebSocket status endpoint (for debugging)
+server.get('/ws/status', async () => {
+  const vaults = wsManager.getConnectedVaults();
+  const status: Record<string, number> = {};
+
+  for (const vault of vaults) {
+    status[vault] = wsManager.getClientCount(vault);
+  }
+
+  return {
+    connected_vaults: vaults.length,
+    clients_by_vault: status,
+  };
+});
+
+// Export WebSocket manager for use by other modules
+export { wsManager };
