@@ -637,7 +637,7 @@ interface WsQuery {
   deviceId?: string;
 }
 
-server.register(async function (fastify) {
+await server.register(async function (fastify) {
   fastify.get<{ Params: VaultParams; Querystring: WsQuery }>(
     '/vault/:vaultName/ws',
     { websocket: true },
